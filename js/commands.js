@@ -4,11 +4,32 @@ var GitTutorial = window.GitTutorial || {};
 (function() {
   'use strict';
 
-  // Helper: get last command arg (for flags like -m, -b)
+  // Helper: extract the value of a flag like -m / --message.
+  // Handles `-m msg`, `-m "multi word msg"`, `-m"msg"` and `--message=msg`.
+  // Everything after -m joins into the message, so multi-word messages survive.
   function getMessage(args, flag) {
-    var idx = args.indexOf(flag);
-    if (idx !== -1 && idx + 1 < args.length) {
-      return args[idx + 1];
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+
+      // --message=msg
+      var eq = a.indexOf('=');
+      if (eq !== -1 && a.substring(0, eq) === flag) {
+        return a.substring(eq + 1);
+      }
+
+      if (a === flag) {
+        if (i + 1 < args.length) {
+          return args.slice(i + 1).join(' ');
+        }
+        return null;
+      }
+
+      // Attached form: -m"msg" / -mmsg
+      if (a.length > flag.length && a.substring(0, flag.length) === flag) {
+        var rest = a.substring(flag.length);
+        rest = rest.replace(/^["']|["']$/g, '');
+        return rest;
+      }
     }
     return null;
   }
@@ -30,6 +51,10 @@ var GitTutorial = window.GitTutorial || {};
       if (args.length === 0) {
         return { success: false, output: '用法: git add <file> 或 git add .' };
       }
+      // git add -A / --all / -u behave like `add .` in this simulator
+      if (args[0] === '-A' || args[0] === '--all' || args[0] === '-u') {
+        return state.add('.');
+      }
       return state.add(args[0]);
     },
 
@@ -41,20 +66,17 @@ var GitTutorial = window.GitTutorial || {};
     // === commit ===
     'commit': function(state, args) {
       var msg = getMessage(args, '-m');
-      if (!msg && args.length > 0 && args[0].startsWith('-m')) {
-        // Handle -m"message" or -m message
-        if (args[0].length > 2) {
-          msg = args[0].substring(2);
-        } else if (args.length > 1) {
-          msg = args[1];
-        }
-      }
+      if (!msg) msg = getMessage(args, '--message');
       if (!msg) {
-        // Check if all args after -m form the message
-        var mIdx = args.indexOf('-m');
-        if (mIdx !== -1) {
-          msg = args.slice(mIdx + 1).join(' ');
+        // Finishing a resolved merge may omit -m: Git supplies the default
+        // merge message. Any other commit needs an explicit message.
+        if (state.pendingMerge) {
+          return state.commit(null);
         }
+        return {
+          success: false,
+          output: '请提供提交信息: git commit -m "你的提交说明"'
+        };
       }
       return state.commit(msg);
     },
@@ -94,8 +116,21 @@ var GitTutorial = window.GitTutorial || {};
         if (delName === state.currentBranch) {
           return { success: false, output: "error: Cannot delete branch '" + delName + "' checked out" };
         }
-        if (!state.branches[delName]) {
+        // Use an `in` check: a branch created before the first commit maps to
+        // null and would otherwise look like a missing branch.
+        if (!(delName in state.branches)) {
           return { success: false, output: "error: branch '" + delName + "' not found." };
+        }
+        // -d refuses to drop a branch holding commits not merged into HEAD.
+        if (args[0] === '-d' && state.branches[delName] && state.HEAD) {
+          var tip = state.branches[delName];
+          if (!state._isAncestor(tip, state.HEAD)) {
+            return {
+              success: false,
+              output: "error: The branch '" + delName + "' is not fully merged.\n" +
+                      "If you are sure you want to delete it, run 'git branch -D " + delName + "'."
+            };
+          }
         }
         delete state.branches[delName];
         return { success: true, output: "Deleted branch " + delName + "." };
@@ -107,6 +142,12 @@ var GitTutorial = window.GitTutorial || {};
     'checkout': function(state, args) {
       if (args.length === 0) {
         return { success: false, output: '用法: git checkout <branch> 或 git checkout -b <branch>' };
+      }
+      if (state.mergeConflict && state.mergeConflict.length > 0) {
+        return {
+          success: false,
+          output: 'error: 你有未解决的合并冲突，请先解决并 commit，或运行 git reset --hard HEAD 放弃合并。\n冲突文件: ' + state.mergeConflict.join(', ')
+        };
       }
       if (args[0] === '-b') {
         if (args.length < 2) {
@@ -132,6 +173,12 @@ var GitTutorial = window.GitTutorial || {};
       if (args.length === 0) {
         return { success: false, output: '用法: git switch <branch> 或 git switch -c <branch>' };
       }
+      if (state.mergeConflict && state.mergeConflict.length > 0) {
+        return {
+          success: false,
+          output: 'error: 你有未解决的合并冲突，请先解决并 commit，或运行 git reset --hard HEAD 放弃合并。\n冲突文件: ' + state.mergeConflict.join(', ')
+        };
+      }
       if (args[0] === '-c') {
         if (args.length < 2) {
           return { success: false, output: '用法: git switch -c <branch-name>' };
@@ -145,6 +192,12 @@ var GitTutorial = window.GitTutorial || {};
     'merge': function(state, args) {
       if (args.length === 0) {
         return { success: false, output: '用法: git merge <branch>' };
+      }
+      if (state.mergeConflict && state.mergeConflict.length > 0) {
+        return {
+          success: false,
+          output: 'error: 上一个合并还有未解决的冲突，请先处理。\n冲突文件: ' + state.mergeConflict.join(', ')
+        };
       }
       return state.merge(args[0]);
     },
@@ -201,19 +254,22 @@ var GitTutorial = window.GitTutorial || {};
 
     // === reset ===
     'reset': function(state, args) {
-      if (args.length === 0) {
-        return { success: false, output: '用法: git reset [--soft|--mixed|--hard] <commit>' };
-      }
       var mode = '--mixed';
-      var target = args[0];
-      if (args[0].startsWith('--')) {
-        mode = args[0];
-        target = args[1];
+      var target = null;
+
+      for (var i = 0; i < args.length; i++) {
+        if (args[i] === '--soft' || args[i] === '--mixed' || args[i] === '--hard') {
+          mode = args[i];
+        } else if (args[i] === '--keep') {
+          mode = '--mixed';
+        } else if (!target) {
+          target = args[i];
+        }
       }
-      if (!target) {
-        // reset HEAD is the default
-        target = 'HEAD';
-      }
+
+      // `git reset` with no revision defaults to HEAD (unstage everything).
+      if (!target) target = 'HEAD';
+
       return state.reset(mode, target);
     },
 
@@ -233,7 +289,11 @@ var GitTutorial = window.GitTutorial || {};
     // === rm ===
     'rm': function(state, args) {
       if (args.length === 0) {
-        return { success: false, output: '用法: git rm <file>' };
+        return { success: false, output: '用法: git rm <file> 或 git rm --cached <file>' };
+      }
+      if (args[0] === '--cached') {
+        if (!args[1]) return { success: false, output: '用法: git rm --cached <file>' };
+        return state.rmCached(args[1]);
       }
       return state.rm(args[0]);
     },
@@ -241,9 +301,26 @@ var GitTutorial = window.GitTutorial || {};
     // === restore ===
     'restore': function(state, args) {
       if (args.length === 0) {
-        return { success: false, output: '用法: git restore <file>' };
+        return { success: false, output: '用法: git restore <file> 或 git restore --staged <file>' };
       }
-      return state.restore(args[0]);
+      if (args[0] === '--staged' || args[0] === '--cached') {
+        if (!args[1]) return { success: false, output: '用法: git restore --staged <file>' };
+        return state.restoreStaged(args[1]);
+      }
+      // git restore --source=<rev> <file> restores the file from that revision.
+      var source = null;
+      for (var i = 0; i < args.length; i++) {
+        if (args[i].indexOf('--source=') === 0) {
+          source = args[i].substring('--source='.length);
+        } else if (args[i] === '--source' || args[i] === '-s') {
+          source = args[i + 1];
+        }
+      }
+      var fileArg = args[args.length - 1];
+      if (source) {
+        return state.restoreFrom(source, fileArg);
+      }
+      return state.restore(fileArg);
     },
 
     // === touch (helper: create file) ===
@@ -315,11 +392,11 @@ var GitTutorial = window.GitTutorial || {};
           '  git rebase <branch>   变基',
           '  git stash [save|pop|list] 暂存工作',
           '  git cherry-pick <hash> 拣选提交',
-          '  git reset [mode] <commit> 重置',
+          '  git reset [mode] <commit> 重置 (支持 HEAD~1 / 短 hash)',
           '  git revert <hash>     撤销提交',
           '  git tag [name]        创建/列出标签',
-          '  git rm <file>         删除文件',
-          '  git restore <file>    恢复文件',
+          '  git rm <file>         删除文件 (--cached 仅取消跟踪)',
+          '  git restore <file>    恢复文件 (--staged 取消暂存)',
           '',
           '辅助命令:',
           '  touch <file>          创建文件',

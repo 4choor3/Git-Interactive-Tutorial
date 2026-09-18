@@ -57,6 +57,12 @@ var GitTutorial = window.GitTutorial || {};
     // Show .git folder indicator when initialized
     var html = '<div class="zone-file"><span class="file-status staged">dir</span></div>';
 
+    // Surface an unresolved merge conflict prominently
+    if (this.state.mergeConflict && this.state.mergeConflict.length > 0) {
+      html += '<div class="zone-empty" style="padding:6px 8px;color:var(--red);font-size:11px">' +
+        '⚠️ 合并冲突待解决: ' + this.state.mergeConflict.length + ' 个文件</div>';
+    }
+
     if (files.length === 0) {
       html += '<div class="zone-empty" style="padding-top:8px">工作区干净</div>';
     } else {
@@ -65,6 +71,11 @@ var GitTutorial = window.GitTutorial || {};
         var f = this.state.workingDir[fname];
         var statusClass = f.status || '';
         var statusText = this._statusLabel(f.status);
+        // A conflicted file is highlighted as such
+        if (this.state.mergeConflict && this.state.mergeConflict.indexOf(fname) !== -1) {
+          statusClass = 'deleted';
+          statusText = 'conflict';
+        }
         html += '<div class="zone-file">' +
           '<span class="file-name">' + this._escapeHtml(fname) + '</span>' +
           (statusText ? '<span class="file-status ' + statusClass + '">' + statusText + '</span>' : '') +

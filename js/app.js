@@ -136,10 +136,25 @@
 
     for (var i = 0; i < codeMatch.length; i++) {
       var expectedCmd = codeMatch[i].replace(/<\/?code>/g, '').trim();
-      if (normalizedInput === expectedCmd || normalizedInput.startsWith(expectedCmd)) {
+      if (!expectedCmd) continue;
+
+      var normalizedExpected = expectedCmd.replace(/\s+/g, ' ');
+
+      // Exact match, or the user typed the expected command with trailing
+      // arguments. Compare token-wise so `git commit -m "first"` does not
+      // satisfy a task that only asked for `git commit`.
+      if (normalizedInput === normalizedExpected) {
         renderer.markTaskCompleted();
         if (card.id === 'ch5-pull') celebrate();
-        break;
+        return;
+      }
+
+      // A prompt with no flags (e.g. `git status`) also accepts extra args.
+      var expectsFlags = /\s-/.test(normalizedExpected);
+      if (!expectsFlags && normalizedInput.indexOf(normalizedExpected + ' ') === 0) {
+        renderer.markTaskCompleted();
+        if (card.id === 'ch5-pull') celebrate();
+        return;
       }
     }
   }
@@ -258,7 +273,10 @@
     e.stopPropagation();
     var target = e.target.closest('.zone-file');
     if (target) {
-      var fileName = target.querySelector('.file-name').textContent;
+      // The .git directory row has no .file-name — ignore it instead of throwing.
+      var nameEl = target.querySelector('.file-name');
+      if (!nameEl) return;
+      var fileName = nameEl.textContent;
       var file = state.workingDir[fileName];
       if (file) {
         document.getElementById('modal-title').textContent = fileName;
@@ -355,7 +373,16 @@
     renderer.renderAll();
   });
   document.getElementById('ctx-delete').addEventListener('click', function() {
-    state.deleteFile(target.querySelector('.file-name').textContent);
+    // `target` is the element captured on right-click; guard against it being
+    // stale (e.g. the menu was opened before a re-render).
+    if (target) {
+      var nameEl = target.querySelector('.file-name');
+      if (nameEl) {
+        var res = state.deleteFile(nameEl.textContent);
+        if (res && res.output) renderer.renderTerminalOutput(res);
+      }
+    }
+    document.getElementById('ctx-menu').hidden = true;
     renderer.renderAll();
   });
 
@@ -377,6 +404,8 @@
         remote: state.remote,
         stash: state.stash,
         tags: state.tags,
+        mergeConflict: state.mergeConflict,
+        pendingMerge: state.pendingMerge,
         visibleArrows: renderer.visibleArrows
       }));
     } catch (e) {}
