@@ -682,19 +682,24 @@ var GitTutorial = window.GitTutorial || {};
   Renderer.prototype._renderInline = function(line) {
     if (!line) return '';
 
+    // Structural markers are detected on the raw line, but every piece of
+    // content goes through _formatInline, which escapes HTML first.
+    var m;
+
     // Headers
-    if (/^### (.+)$/.test(line)) return '<h3>' + RegExp.$1 + '</h3>';
-    if (/^## (.+)$/.test(line)) return '<h2>' + RegExp.$1 + '</h2>';
+    m = line.match(/^### (.+)$/);
+    if (m) return '<h3>' + this._formatInline(m[1]) + '</h3>';
+    m = line.match(/^## (.+)$/);
+    if (m) return '<h2>' + this._formatInline(m[1]) + '</h2>';
 
     // List items
-    if (/^- (.+)$/.test(line)) {
-      return '<li>' + this._formatInline(RegExp.$1) + '</li>';
-    }
+    m = line.match(/^- (.+)$/);
+    if (m) return '<li>' + this._formatInline(m[1]) + '</li>';
 
-    // Blockquote
-    if (/^>\s?(.+)$/.test(line)) {
-      return '<blockquote>' + this._formatInline(RegExp.$1) + '</blockquote>';
-    }
+    // Blockquote — the leading > is markdown syntax and is consumed here,
+    // so it must be matched before escaping turns it into &gt;.
+    m = line.match(/^>\s?(.+)$/);
+    if (m) return '<blockquote>' + this._formatInline(m[1]) + '</blockquote>';
 
     // Skip empty lines
     if (/^\s*$/.test(line)) return '';
@@ -704,7 +709,13 @@ var GitTutorial = window.GitTutorial || {};
   };
 
   Renderer.prototype._formatInline = function(text) {
-    return text
+    // Escape HTML FIRST. Card content is written with plain-text placeholders
+    // like `git add <file>` or `echo "x" >> log`; emitting them raw makes the
+    // browser swallow `<file>` as an unknown tag and can also eat `>>`.
+    // Escaping up front keeps every literal character visible, then the
+    // markdown replacements below build the real tags on top.
+    var s = this._escapeHtml(text);
+    return s
       .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
       .replace(/\*(.+?)\*/g, '<em>$1</em>')
       .replace(/`([^`]+)`/g, '<code>$1</code>')

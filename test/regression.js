@@ -409,6 +409,104 @@
     }
   })();
 
+  // ============ 22. Markdown 渲染保留字面量 < > ============
+  (function(){
+
+    var GT = window.GitTutorial;
+    var r = new GT.Renderer(new GT.GitState());
+    var out = [];
+    var bad = 0;
+
+    function strip(html){
+      var d = document.createElement('div');
+      d.innerHTML = html;
+      return d.textContent;
+    }
+
+    // A. 卡片正文：跳过代码块与 blockquote 语法行，其余行的 > < 字面量必须保留
+    GT.tutorials.forEach(function(card){
+      var lines = (card.content || '').split('\n');
+      var inCode = false;
+      lines.forEach(function(line, idx){
+        if (/^```/.test(line)) { inCode = !inCode; return; }
+        if (inCode) return;
+        if (/^\s*>/.test(line)) return;
+        var rendered = strip(r._renderInline(line));
+        var rawGt = (line.match(/>/g) || []).length;
+        var txtGt = (rendered.match(/>/g) || []).length;
+        var rawLt = (line.match(/</g) || []).length;
+        var txtLt = (rendered.match(/</g) || []).length;
+        if (rawGt !== txtGt || rawLt !== txtLt) {
+          bad++;
+          out.push('X 正文 ' + card.id + ' 行' + (idx + 1));
+          out.push('    raw : ' + JSON.stringify(line));
+          out.push('    text: ' + JSON.stringify(rendered));
+        }
+      });
+    });
+
+    // B. 代码块内容必须原样保留
+    GT.tutorials.forEach(function(card){
+      var md = card.content || '';
+      var blocks = md.match(/```[\s\S]*?```/g) || [];
+      blocks.forEach(function(b, i){
+        var inner = b.replace(/^```[^\n]*\n?/, '').replace(/\n?```$/, '').trim();
+        if (!inner) return;
+        var rendered = strip(r._renderMarkdown('```\n' + inner + '\n```')).trim();
+        if (rendered !== inner) {
+          bad++;
+          out.push('X 代码块 ' + card.id + ' #' + i);
+          out.push('    raw : ' + JSON.stringify(inner));
+          out.push('    text: ' + JSON.stringify(rendered));
+        }
+      });
+    });
+
+    // C. 任务提示：<code> 内的命令必须完整可见
+    GT.tutorials.forEach(function(card){
+      if (!card.task || !card.task.prompt) return;
+      var p = card.task.prompt;
+      if (p.indexOf('<code>') === -1) return;
+      var el = document.createElement('div');
+      el.innerHTML = p;
+      var text = el.textContent;
+      var codes = p.match(/<code>[\s\S]*?<\/code>/g) || [];
+      codes.forEach(function(c){
+        var inner = c.replace(/<\/?code>/g, '').trim();
+        if (text.indexOf(inner) === -1) {
+          bad++;
+          out.push('X 任务 ' + card.id + ' 代码内容未完整显示');
+          out.push('    code: ' + JSON.stringify(inner));
+          out.push('    text: ' + JSON.stringify(text));
+        }
+      });
+    });
+
+    // D. 终端回显
+    var inp = document.getElementById('terminal-input');
+    var term = document.getElementById('terminal-output');
+    if (inp && term) {
+      var saved = term.innerHTML;
+      term.innerHTML = '';
+      var cases = ['echo "test" >> f.txt', 'echo "a" > b.txt', 'git commit -m "x >> y"'];
+      cases.forEach(function(c){
+        inp.value = c;
+        inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      });
+      var lines = term.querySelectorAll('.terminal-line.input');
+      for (var i = 0; i < cases.length; i++) {
+        var got = lines[i] ? lines[i].textContent : '(missing)';
+        if (got.indexOf(cases[i]) === -1) {
+          bad++;
+          out.push('X 终端回显 ' + JSON.stringify(cases[i]) + ' -> ' + JSON.stringify(got));
+        }
+      }
+      term.innerHTML = saved;
+    }
+
+    check('Markdown 渲染保留字面量 < >', bad === 0, out.join(' | '));
+  })();
+
   return JSON.stringify({
     pass: pass,
     fail: fail,
