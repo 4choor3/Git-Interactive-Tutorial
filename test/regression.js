@@ -743,6 +743,51 @@
     check('createFile 无参使用默认内容', t.s.workingDir['e3.txt'].content === 'hello world',
       JSON.stringify(t.s.workingDir['e3.txt'].content));
   })();
+
+  // ============ 34. Markdown 链接 / 图片安全与解析 ============
+  (function(){
+    var r = new GT.Renderer(new GT.GitState());
+    function dom(h){ var d = document.createElement('div'); d.innerHTML = h; return d; }
+
+    // URL containing balanced parens must not be truncated
+    var a = dom(r._formatInline('[link](http://x.com/a(b))'));
+    var link = a.querySelector('a');
+    check('链接 URL 含括号不被截断',
+      link && link.getAttribute('href') === 'http://x.com/a(b)',
+      link ? link.getAttribute('href') : '(no link)');
+
+    // A quote in the URL must not escape the attribute
+    var b = dom(r._formatInline('![alt](u"onerror=alert(1))'));
+    var img = b.querySelector('img');
+    check('URL 中的引号无法注入属性',
+      img !== null && !img.hasAttribute('onerror'),
+      b.innerHTML);
+
+    // Script-bearing schemes are neutralised
+    var c = dom(r._formatInline('[x](javascript:alert(1))'));
+    var jlink = c.querySelector('a');
+    check('javascript: 链接被替换为 #',
+      jlink && jlink.getAttribute('href') === '#',
+      jlink ? jlink.getAttribute('href') : '(no link)');
+
+    // Ordinary links and images still work
+    var d = dom(r._formatInline('[ok](https://github.com/u/r)'));
+    check('普通链接正常渲染',
+      d.querySelector('a') && d.querySelector('a').getAttribute('href') === 'https://github.com/u/r',
+      d.innerHTML);
+    var e = dom(r._formatInline('![图](https://x.com/i.png)'));
+    check('普通图片正常渲染', e.querySelector('img') !== null, e.innerHTML);
+
+    // Card literals must survive
+    function strip(h){ var x = document.createElement('div'); x.innerHTML = h; return x.textContent; }
+    check('反引号内星号不被当强调', r._formatInline('`a*b`') === '<code>a*b</code>', r._formatInline('`a*b`'));
+    check('卡片 <file> 字面量保留',
+      strip(r._formatInline('`git add <file>` 说明')) === 'git add <file> 说明',
+      strip(r._formatInline('`git add <file>` 说明')));
+    check('卡片 >> 字面量保留',
+      strip(r._formatInline('`>>` 追加')) === '>> 追加',
+      strip(r._formatInline('`>>` 追加')));
+  })();
   return JSON.stringify({
     pass: pass,
     fail: fail,

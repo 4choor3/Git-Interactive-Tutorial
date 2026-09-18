@@ -715,12 +715,32 @@ var GitTutorial = window.GitTutorial || {};
     // Escaping up front keeps every literal character visible, then the
     // markdown replacements below build the real tags on top.
     var s = this._escapeHtml(text);
+    var self = this;
     return s
       .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
       .replace(/\*(.+?)\*/g, '<em>$1</em>')
       .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%">')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" style="color:var(--accent)">$1</a>');
+      .replace(/!\[([^\]]*)\]\(((?:[^()]|\([^()]*\))*)\)/g, function(m, alt, url) {
+        return '<img src="' + self._safeUrl(url) + '" alt="' + alt + '" style="max-width:100%">';
+      })
+      .replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))*)\)/g, function(m, label, url) {
+        return '<a href="' + self._safeUrl(url) + '" target="_blank" style="color:var(--accent)">' + label + '</a>';
+      });
+  };
+
+  // Sanitize a URL destined for an HTML attribute. The markdown patterns run
+  // after escaping, so a quote inside the URL would otherwise close the
+  // attribute and let the rest of the URL inject markup.
+  Renderer.prototype._safeUrl = function(url) {
+    var u = String(url).trim();
+    // Block script-bearing schemes outright.
+    if (/^\s*(javascript|data|vbscript):/i.test(u)) return '#';
+    return u
+      .replace(/"/g, '%22')
+      .replace(/'/g, '%27')
+      .replace(/</g, '%3C')
+      .replace(/>/g, '%3E')
+      .replace(/&(?!amp;|lt;|gt;|quot;|#)/g, '&amp;');
   };
 
   // === Full Render ===
