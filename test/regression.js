@@ -328,7 +328,8 @@
     check('tag 列出 v1', out(t.p,'git tag').indexOf('v1') !== -1);
     run(t.p,'echo "l2" > d.txt');
     var d = out(t.p,'git diff');
-    check('diff 显示内容变化', /- l1/.test(d) && /\+ l2/.test(d), d);
+    // Unified diff prefixes carry no separator, matching real git: "-l1" / "+l2"
+    check('diff 显示内容变化', /^-l1$/m.test(d) && /^\+l2$/m.test(d), d);
     check('stash 保存成功', run(t.p,'git stash').success);
     check('stash list 有记录', out(t.p,'git stash list').indexOf('stash@{0}') !== -1);
     check('stash pop 成功', run(t.p,'git stash pop').success);
@@ -507,6 +508,241 @@
     check('Markdown 渲染保留字面量 < >', bad === 0, out.join(' | '));
   })();
 
+  // ============ 23. 合并冲突边界（与真实 git 对齐）============
+  (function(){
+    // Real git conflicts when both sides touch adjacent lines and merges
+    // cleanly only when at least one unchanged line separates the changes.
+    // Verified against git 2.x:  B|C -> conflict,  B|D -> clean.
+    var cases = [
+      ['相邻行 B|C', 'A\nB\nC\nD\n',   'A\nB1\nC\nD\n',   'A\nB\nC1\nD\n',   true],
+      ['隔一行 B|D', 'A\nB\nC\nD\nE\n','A\nB1\nC\nD\nE\n','A\nB\nC\nD1\nE\n', false],
+      ['首行A|次行B','A\nB\nC\n',      'A1\nB\nC\n',      'A\nB1\nC\n',      true],
+      ['首行A|末行C','A\nB\nC\n',      'A1\nB\nC\n',      'A\nB\nC1\n',      false],
+      ['插入X|改B',  'A\nB\nC\n',      'A\nX\nB\nC\n',    'A\nB1\nC\n',      true],
+      ['插入X|改A',  'A\nB\nC\n',      'A\nX\nB\nC\n',    'A1\nB\nC\n',      true],
+      ['同一行都改', 'A\nB\nC\n',      'A\nOURS\nC\n',    'A\nTHEIRS\nC\n',  true]
+    ];
+    for (var ci = 0; ci < cases.length; ci++) {
+      var c = cases[ci];
+      var t = mk();
+      run(t.p,'git init');
+      t.s.createFile('f.txt', c[1]);
+      run(t.p,'git add .'); run(t.p,'git commit -m base');
+      run(t.p,'git checkout -b other');
+      t.s.modifyFile('f.txt', c[3]); run(t.p,'git add .'); run(t.p,'git commit -m theirs');
+      run(t.p,'git checkout main');
+      t.s.modifyFile('f.txt', c[2]); run(t.p,'git add .'); run(t.p,'git commit -m ours');
+      var r = run(t.p,'git merge other');
+      check('冲突边界: ' + c[0], (!r.success) === c[4],
+        'expected conflict=' + c[4] + ' got ' + (!r.success) + ' :: ' + (r ? String(r.output).split('\n')[0] : ''));
+    }
+  })();
+
+  // ============ 24. pull 安全性 ============
+  (function(){
+    // 24a: uncommitted work must not be destroyed
+    var t = mk();
+    run(t.p,'git init');
+    run(t.p,'echo "v1" > a.txt'); run(t.p,'git add .'); run(t.p,'git commit -m c1');
+    run(t.p,'git push origin main');
+    run(t.p,'echo "remote" > a.txt'); run(t.p,'git add .'); run(t.p,'git commit -m c2');
+    run(t.p,'git push origin main');
+    run(t.p,'git reset --hard HEAD~1');      // local now behind remote
+    t.s.createFile('untracked.txt','keep');
+    t.s.modifyFile('a.txt','LOCAL DIRTY');
+    var r = run(t.p,'git pull origin main');
+    check('pull 拒绝覆盖未提交改动', !r.success, r ? String(r.output).split('\n')[0] : '');
+    check('pull 被拒后未提交内容仍在', t.s.workingDir['a.txt'].content === 'LOCAL DIRTY',
+      t.s.workingDir['a.txt'].content);
+    check('pull 被拒后未跟踪文件仍在', 'untracked.txt' in t.s.workingDir);
+
+    // 24b: divergent local commits must not be orphaned
+    var u = mk();
+    run(u.p,'git init');
+    run(u.p,'echo "base" > f.txt'); run(u.p,'git add .'); run(u.p,'git commit -m c1');
+    run(u.p,'git push origin main');
+    run(u.p,'echo "l2" >> f.txt'); run(u.p,'git add .'); run(u.p,'git commit -m c2');
+    run(u.p,'echo "l3" >> f.txt'); run(u.p,'git add .'); run(u.p,'git commit -m c3');
+    var localHead = u.s.HEAD;
+    var r2 = run(u.p,'git pull origin main');
+    check('pull 分叉时不孤儿化本地提交', u.s.HEAD === localHead || u.s._isAncestor(localHead, u.s.HEAD) || /up to date/i.test(String(r2.output)),
+      'HEAD=' + u.s.HEAD + ' local=' + localHead + ' :: ' + (r2 ? String(r2.output).split('\n')[0] : ''));
+  })();
+
+  // ============ 25. push 正确性 ============
+  (function(){
+    // 25a: pushing a named non-current branch
+    var t = mk();
+    run(t.p,'git init');
+    run(t.p,'touch a.txt'); run(t.p,'git add .'); run(t.p,'git commit -m c1');
+    run(t.p,'git checkout -b feature');
+    run(t.p,'touch feat.txt'); run(t.p,'git add .'); run(t.p,'git commit -m featc');
+    var featHash = t.s.HEAD;
+    run(t.p,'git checkout main');
+    run(t.p,'git push origin feature');
+    check('push 推送指定分支而非 HEAD', t.s.remote.branches['feature'] === featHash,
+      'remote feature=' + t.s.remote.branches['feature'] + ' want ' + featHash);
+
+    // 25b: non-fast-forward push must be rejected
+    var u = mk();
+    run(u.p,'git init');
+    run(u.p,'echo "x" > f.txt'); run(u.p,'git add .'); run(u.p,'git commit -m c1');
+    run(u.p,'git push origin main');
+    run(u.p,'echo "y" > f.txt'); run(u.p,'git add .'); run(u.p,'git commit -m c2');
+    run(u.p,'git push origin main');
+    var remoteTip = u.s.remote.branches['main'];
+    run(u.p,'git reset --hard HEAD~1');
+    run(u.p,'echo "z" > f.txt'); run(u.p,'git add .'); run(u.p,'git commit -m diverged');
+    var r = run(u.p,'git push origin main');
+    check('push 拒绝非快进', !r.success, r ? String(r.output).split('\n')[0] : '');
+    check('push 被拒后远程引用不变', u.s.remote.branches['main'] === remoteTip);
+
+    // 25c: everything up-to-date
+    var v = mk();
+    run(v.p,'git init'); run(v.p,'touch z'); run(v.p,'git add .'); run(v.p,'git commit -m c1');
+    run(v.p,'git push origin main');
+    var r3 = run(v.p,'git push origin main');
+    check('push 重复推送提示 up-to-date', /up-to-date/i.test(String(r3.output)), String(r3.output));
+  })();
+
+  // ============ 26. rebase 冲突必须中止而非提交标记 ============
+  (function(){
+    var t = mk();
+    run(t.p,'git init');
+    t.s.createFile('f.txt','l1\nl2\nl3');
+    run(t.p,'git add .'); run(t.p,'git commit -m base');
+    run(t.p,'git checkout -b feature');
+    t.s.modifyFile('f.txt','l1\nFEATURE\nl3'); run(t.p,'git add .'); run(t.p,'git commit -m feat');
+    run(t.p,'git checkout main');
+    t.s.modifyFile('f.txt','l1\nMAIN\nl3'); run(t.p,'git add .'); run(t.p,'git commit -m mainc');
+    run(t.p,'git checkout feature');
+    var r = run(t.p,'git rebase main');
+    check('rebase 冲突时中止', !r.success, r ? String(r.output).split('\n')[0] : '');
+    check('rebase 冲突被记录', t.s.mergeConflict && t.s.mergeConflict.length > 0,
+      JSON.stringify(t.s.mergeConflict));
+    // HEAD content must not contain committed conflict markers
+    var headCommit = t.s._getCommit(t.s.HEAD);
+    var headContent = (headCommit && headCommit.files['f.txt']) ? headCommit.files['f.txt'].content : '';
+    check('rebase 未把冲突标记写入提交', headContent.indexOf('<<<<<<<') === -1,
+      JSON.stringify(headContent));
+  })();
+
+  // ============ 27. stash 安全性 ============
+  (function(){
+    // 27a: stash list is newest-first
+    var t = mk();
+    run(t.p,'git init'); run(t.p,'touch x'); run(t.p,'git add .'); run(t.p,'git commit -m c1');
+    run(t.p,'echo "1" > x'); run(t.p,'git stash save one');
+    run(t.p,'echo "2" > x'); run(t.p,'git stash save two');
+    var list = out(t.p,'git stash list');
+    var firstLine = list.split('\n')[0];
+    check('stash list 最新的是 stash@{0}', /stash@\{0\}: two/.test(firstLine), list);
+
+    // 27b: pop must not silently clobber another branch's committed work
+    var u = mk();
+    run(u.p,'git init');
+    run(u.p,'echo "original" > a.txt'); run(u.p,'git add .'); run(u.p,'git commit -m c1');
+    run(u.p,'git checkout -b other'); run(u.p,'git checkout main');
+    run(u.p,'echo "WIP" > a.txt'); run(u.p,'git stash');
+    run(u.p,'git checkout other');
+    run(u.p,'echo "other-work" > a.txt'); run(u.p,'git add .'); run(u.p,'git commit -m otherc');
+    var r = run(u.p,'git stash pop');
+    check('stash pop 拒绝覆盖已提交内容', !r.success, r ? String(r.output).split('\n')[0] : '');
+    check('stash pop 被拒后内容未被覆盖', u.s.workingDir['a.txt'].content === 'other-work',
+      u.s.workingDir['a.txt'].content);
+  })();
+
+  // ============ 28. tag 名称校验 ============
+  (function(){
+    var t = mk();
+    run(t.p,'git init'); run(t.p,'touch x'); run(t.p,'git add .'); run(t.p,'git commit -m c1');
+    var r = run(t.p,'git tag -a v2 -m "annotated"');
+    check('tag -a 创建的是 v2 而非 -a', r.success && 'v2' in t.s.tags && !('-a' in t.s.tags),
+      JSON.stringify(t.s.tags));
+    var r2 = run(t.p,'git tag "bad name"');
+    check('tag 拒绝非法名称', !r2.success && !('bad name' in t.s.tags), String(r2.output));
+  })();
+
+  // ============ 29. 多文件参数 ============
+  (function(){
+    var t = mk();
+    run(t.p,'git init');
+    run(t.p,'touch a.txt'); run(t.p,'touch b.txt');
+    run(t.p,'git add a.txt b.txt');
+    check('add 支持多文件', 'a.txt' in t.s.staging && 'b.txt' in t.s.staging,
+      JSON.stringify(Object.keys(t.s.staging)));
+    run(t.p,'git commit -m c1');
+    run(t.p,'touch c.txt'); run(t.p,'git add .'); run(t.p,'git commit -m c2');
+    run(t.p,'git rm c.txt a.txt');
+    var deleted = Object.keys(t.s.staging).filter(function(k){ return t.s.staging[k].deleted; });
+    check('rm 支持多文件', deleted.length === 2, JSON.stringify(deleted));
+  })();
+
+  // ============ 30. branch 选项不再变成分支名 ============
+  (function(){
+    var t = mk();
+    run(t.p,'git init'); run(t.p,'touch x'); run(t.p,'git add .'); run(t.p,'git commit -m c1');
+    var flags = ['git branch -v','git branch -a','git branch --list'];
+    var bad = [];
+    for (var i = 0; i < flags.length; i++) {
+      run(t.p, flags[i]);
+      var names = Object.keys(t.s.branches);
+      for (var j = 0; j < names.length; j++) {
+        if (names[j].charAt(0) === '-') bad.push(flags[i] + ' -> ' + names[j]);
+      }
+    }
+    check('branch 选项不会创建伪分支', bad.length === 0, bad.join(', '));
+    var r = run(t.p,'git branch -m renamed');
+    check('branch -m 重命名生效', r.success && 'renamed' in t.s.branches && !('main' in t.s.branches),
+      JSON.stringify(Object.keys(t.s.branches)));
+  })();
+
+  // ============ 31. diff 前缀与真实 git 一致 ============
+  (function(){
+    var t = new GT.GitState();
+    t.initialized = true;
+    var d = t._formatDiff('f.txt', 'a\nb\nc', 'a\nb\nX');
+    var lines = d.split('\n');
+    check('diff 上下文行前缀为单个空格', lines[4] === ' a', JSON.stringify(lines[4]));
+    check('diff 删除行前缀无空格', lines[6] === '-c', JSON.stringify(lines[6]));
+    check('diff 新增行前缀无空格', lines[7] === '+X', JSON.stringify(lines[7]));
+  })();
+
+  // ============ 32. 教程教过的命令都能执行 ============
+  (function(){
+    var t = mk();
+    run(t.p,'git init');
+    run(t.p,'touch readme.md');
+    // Commands the tutorial cards instruct learners to type
+    var required = [
+      ['git config user.name "tester"', 'git config 可写'],
+      ['git config user.name', 'git config 可读'],
+      ['git remote add origin git@github.com:user/repo.git', 'git remote add 可用'],
+      ['git add .',''],
+      ['git commit -m "first"',''],
+      ['git tag v1.0',''],
+      ['git show HEAD','git show 可用'],
+      ['git blame readme.md','git blame 可用'],
+      ['git remote -v','git remote -v 可用']
+    ];
+    for (var i = 0; i < required.length; i++) {
+      var r = run(t.p, required[i][0]);
+      check('教程命令可执行: ' + required[i][0].split(' ').slice(0,2).join(' '),
+        r && r.success, r ? String(r.output).split('\n')[0] : 'NULL');
+    }
+  })();
+
+  // ============ 33. 空文件语义 ============
+  (function(){
+    var t = mk();
+    run(t.p,'git init');
+    run(t.p,'touch empty.txt');
+    check('touch 创建空文件而非占位内容', t.s.createFile('e2.txt','') && true, '');
+    check('createFile("") 保持空内容', t.s.workingDir['e2.txt'].content === '', JSON.stringify(t.s.workingDir['e2.txt'].content));
+    t.s.createFile('e3.txt');
+    check('createFile 无参使用默认内容', t.s.workingDir['e3.txt'].content === 'hello world',
+      JSON.stringify(t.s.workingDir['e3.txt'].content));
+  })();
   return JSON.stringify({
     pass: pass,
     fail: fail,

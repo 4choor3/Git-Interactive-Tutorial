@@ -25,10 +25,15 @@ var GitTutorial = window.GitTutorial || {};
     this.HEAD = null;        // commitHash
     this.remote = {          // simulated remote
       commits: [],
-      branches: {}
+      branches: {},
+      url: null              // set by `git remote add <name> <url>`
     };
     this.stash = [];
     this.tags = {};          // { name: commitHash }
+    this.config = {          // `git config` values, local + global
+      local: {},
+      global: {}
+    };
     this.mergeConflict = null;  // [filenames] with unresolved <<<<<<< markers
     this.mergeConflictKinds = null;  // { path: 'content' | 'modify/delete' | 'add/add' }
     this.pendingMerge = null;   // { branch, targetHash } waiting for a resolution commit
@@ -52,7 +57,12 @@ var GitTutorial = window.GitTutorial || {};
     if (!this.initialized) {
       return { success: false, output: '尚未初始化仓库。请先输入: git init' };
     }
-    content = content || 'hello world';
+    // Only a genuinely missing value falls back to the placeholder. An empty
+    // string is a legitimate file body (`touch f` and `echo "" > f` both
+    // create an empty file), so it must not be overwritten.
+    if (content === undefined || content === null) {
+      content = 'hello world';
+    }
     this.workingDir[filename] = { content: content, status: 'new' };
     return { success: true, output: '创建文件: ' + filename };
   };
@@ -210,7 +220,8 @@ var GitTutorial = window.GitTutorial || {};
       files: files,
       parent: this.HEAD,
       timestamp: Date.now(),
-      branch: this.currentBranch
+      branch: this.currentBranch,
+      author: this._authorName()
     };
 
     // If a conflicted merge was just resolved, record the second parent so the
@@ -448,7 +459,9 @@ var GitTutorial = window.GitTutorial || {};
       if (newStart === -1) newStart = 0;
       result.push('@@ -' + oldStart + ',' + oldCount + ' +' + newStart + ',' + newCount + ' @@');
       for (var l = hunk.start; l <= hunk.end; l++) {
-        result.push(raw[l].type + ' ' + raw[l].line);
+        // Unified diff prefixes carry no separator: context is a single leading
+        // space, additions start with '+' and deletions with '-'.
+        result.push(raw[l].type + raw[l].line);
       }
     }
 
@@ -902,28 +915,60 @@ var GitTutorial = window.GitTutorial || {};
     }
   };
 
+  // Pull remote-only commits into the local object store.
+  GitState.prototype._importRemoteCommits = function() {
+    for (var j = 0; j < this.remote.commits.length; j++) {
+      var rc = this.remote.commits[j];
+      if (!this._getCommit(rc.hash)) {
+        this.commits.push(rc);
+      }
+    }
+  };
+
   // === Git Push ===
   GitState.prototype.push = function(remote, branch) {
     if (!this.initialized) {
       return { success: false, output: '尚未初始化仓库。请先输入: git init' };
     }
     remote = remote || 'origin';
+    // Default to the current branch, but a named branch must actually be pushed.
     branch = branch || this.currentBranch;
 
-    if (!this.HEAD) {
-      return { success: false, output: 'error: 没有可以 push 的提交' };
+    if (!branch) {
+      return { success: false, output: 'error: 处于 detached HEAD，请指定要推送的分支名' };
+    }
+    if (!(branch in this.branches)) {
+      return { success: false, output: "error: src refspec " + branch + " does not match any" };
     }
 
-    // Copy current branch commits to remote
-    var current = this.HEAD;
+    var branchHash = this.branches[branch];
+    if (!branchHash) {
+      return { success: false, output: 'error: 分支 ' + branch + ' 还没有任何提交' };
+    }
+
+    // A push that would drop remote commits must be refused, exactly like git.
+    var remoteTip = this.remote.branches[branch];
+    if (remoteTip && remoteTip !== branchHash && !this._isAncestor(remoteTip, branchHash)) {
+      return {
+        success: false,
+        output: 'To ' + remote + '\n' +
+                ' ! [rejected]        ' + branch + ' -> ' + branch + ' (non-fast-forward)\n' +
+                'error: failed to push some refs to \'' + remote + '\'\n' +
+                'hint: 远程包含你本地没有的提交，请先 git pull 再推送。'
+      };
+    }
+
+    if (remoteTip === branchHash) {
+      return { success: true, output: 'Everything up-to-date' };
+    }
+
+    // Collect every commit reachable from the branch tip that the remote lacks.
+    var current = branchHash;
     var commitsToPush = [];
     while (current) {
       var found = false;
       for (var i = 0; i < this.remote.commits.length; i++) {
-        if (this.remote.commits[i].hash === current) {
-          found = true;
-          break;
-        }
+        if (this.remote.commits[i].hash === current) { found = true; break; }
       }
       if (found) break;
 
@@ -937,11 +982,15 @@ var GitTutorial = window.GitTutorial || {};
       this.remote.commits.push(commitsToPush[j]);
     }
 
-    this.remote.branches[branch] = this.HEAD;
+    var isNew = !remoteTip;
+    this.remote.branches[branch] = branchHash;
 
     return {
       success: true,
-      output: "Enumerating objects: " + commitsToPush.length + "\nWriting objects: 100%\nTo " + remote + "\n * [new branch]      " + branch + " -> " + branch
+      output: 'Enumerating objects: ' + commitsToPush.length + '\n' +
+              'Writing objects: 100%\n' +
+              'To ' + remote + '\n' +
+              ' * [' + (isNew ? 'new branch' : 'updated') + ']      ' + branch + ' -> ' + branch
     };
   };
 
@@ -970,9 +1019,109 @@ var GitTutorial = window.GitTutorial || {};
       return { success: false, output: '远程没有新的提交' };
     }
 
-    // Fast-forward
+    // Guard 1: uncommitted work must not be silently destroyed by the checkout
+    // that a pull performs. Real git aborts before touching the working tree.
+    var dirty = [];
+    for (var df in this.workingDir) {
+      if (this.workingDir[df].status !== 'committed') dirty.push(df);
+    }
+    for (var sf in this.staging) {
+      if (dirty.indexOf(sf) === -1) dirty.push(sf);
+    }
+    if (dirty.length > 0) {
+      return {
+        success: false,
+        output: 'error: 本地有未提交的修改，pull 会覆盖它们。\n' +
+                '  ' + dirty.join('\n  ') + '\n' +
+                '请先 git commit 或 git stash，再 pull。'
+      };
+    }
+
+    var localHash = this.HEAD;
+
+    // Guard 2: only fast-forward when the local branch really is behind.
+    // If HEAD is not an ancestor of the remote tip the histories diverged, and
+    // blindly resetting to the remote hash would orphan local commits.
+    if (localHash && !this._isAncestor(localHash, remoteHash)) {
+      if (this._isAncestor(remoteHash, localHash)) {
+        return { success: true, output: 'Already up to date.' };
+      }
+      // Merge the remote tip into the current branch instead of discarding work.
+      this._importRemoteCommits();
+      var baseHash = this._mergeBase(localHash, remoteHash);
+      var baseCommit = baseHash ? this._getCommit(baseHash) : null;
+      var baseFiles = (baseCommit && baseCommit.files) || {};
+      var ourCommit = this._getCommit(localHash);
+      var ourFiles = (ourCommit && ourCommit.files) || {};
+      var mergedFiles = {};
+      var conflicts = [];
+      var paths = {};
+      for (var bp in baseFiles) paths[bp] = true;
+      for (var op in ourFiles) paths[op] = true;
+      for (var tp in remoteCommit.files) paths[tp] = true;
+
+      for (var path in paths) {
+        var b = baseFiles[path] ? baseFiles[path].content : undefined;
+        var o = ourFiles[path] ? ourFiles[path].content : undefined;
+        var th = remoteCommit.files[path] ? remoteCommit.files[path].content : undefined;
+        if (o === th || th === undefined) {
+          if (o !== undefined) mergedFiles[path] = { content: o };
+          continue;
+        }
+        if (o === undefined || b === o) {
+          if (th !== undefined) mergedFiles[path] = { content: th };
+          continue;
+        }
+        var res = this._mergeFileContent(b || '', o, th, 'origin/' + branch);
+        mergedFiles[path] = { content: res.content };
+        if (res.conflict) conflicts.push(path);
+      }
+
+      this.workingDir = {};
+      this.staging = {};
+      for (var mf in mergedFiles) {
+        this.workingDir[mf] = {
+          content: mergedFiles[mf].content,
+          status: conflicts.indexOf(mf) !== -1 ? 'modified' : 'committed'
+        };
+      }
+
+      if (conflicts.length > 0) {
+        this.mergeConflict = conflicts;
+        this.mergeConflictKinds = null;
+        this.pendingMerge = { branch: 'origin/' + branch, targetHash: remoteHash };
+        return {
+          success: false,
+          output: 'From ' + remote + '\n * branch            ' + branch + '     -> FETCH_HEAD\n' +
+                  'error: 合并远程更新时产生冲突。\n冲突文件: ' + conflicts.join(', ') + '\n' +
+                  '解决后 git add <file> 并 git commit。'
+        };
+      }
+
+      var mergeHash = generateHash();
+      this.commits.push({
+        hash: mergeHash,
+        message: "Merge branch '" + branch + "' of " + remote + " into " + this.currentBranch,
+        files: mergedFiles,
+        parent: localHash,
+        mergeParent: remoteHash,
+        timestamp: Date.now(),
+        branch: this.currentBranch,
+        author: this._authorName()
+      });
+      this.HEAD = mergeHash;
+      if (this.currentBranch) this.branches[this.currentBranch] = mergeHash;
+
+      return {
+        success: true,
+        output: 'From ' + remote + '\n * branch            ' + branch + '     -> FETCH_HEAD\n' +
+                'Merge made by the \'ort\' strategy.\ncommit ' + mergeHash
+      };
+    }
+
+    // Genuine fast-forward: the local tip is an ancestor of the remote tip.
     this.HEAD = remoteHash;
-    this.branches[this.currentBranch] = remoteHash;
+    if (this.currentBranch) this.branches[this.currentBranch] = remoteHash;
 
     this.workingDir = {};
     this.staging = {};
@@ -982,20 +1131,7 @@ var GitTutorial = window.GitTutorial || {};
       }
     }
 
-    // Also add commits to local
-    for (var j = 0; j < this.remote.commits.length; j++) {
-      var rc = this.remote.commits[j];
-      var exists = false;
-      for (var k = 0; k < this.commits.length; k++) {
-        if (this.commits[k].hash === rc.hash) {
-          exists = true;
-          break;
-        }
-      }
-      if (!exists) {
-        this.commits.push(rc);
-      }
-    }
+    this._importRemoteCommits();
 
     return {
       success: true,
@@ -1108,19 +1244,66 @@ var GitTutorial = window.GitTutorial || {};
       for (var tf in srcFiles) touched[tf] = true;
       for (var bf in baseFiles) touched[bf] = true;
 
+      var replayedConflicts = [];
+
       for (var path in touched) {
-        var baseContent = baseFiles[path] ? baseFiles[path].content : '';
-        var srcContent = srcFiles[path] ? srcFiles[path].content : '';
+        var baseEntry = baseFiles[path];
+        var srcEntry = srcFiles[path];
+        var baseContent = baseEntry ? baseEntry.content : '';
+        var srcContent = srcEntry ? srcEntry.content : '';
         var curContent = nextFiles[path] ? nextFiles[path].content : '';
 
-        if (baseContent === srcContent) continue;
+        // Compare presence as well as content: a commit that ADDS an empty file
+        // has baseContent === srcContent === '' but is still a real change.
+        var baseExists = !!baseEntry;
+        var srcExists = !!srcEntry;
+        if (baseExists === srcExists && baseContent === srcContent) continue;
+
+        // Explicit add / delete
+        if (!baseExists && srcExists) {
+          nextFiles[path] = { content: srcContent };
+          continue;
+        }
+        if (baseExists && !srcExists) {
+          delete nextFiles[path];
+          continue;
+        }
 
         var res = this._mergeFileContent(baseContent, curContent, srcContent, 'rebase');
+        if (res.conflict) replayedConflicts.push(path);
         if (res.content === '' && srcContent === '') {
           delete nextFiles[path];
         } else {
           nextFiles[path] = { content: res.content };
         }
+      }
+
+      // A replayed commit that conflicts must stop the rebase, exactly like
+      // git. Committing the markers would bake them into history and report a
+      // successful rebase for work that never actually applied.
+      if (replayedConflicts.length > 0) {
+        // Keep the commits replayed so far: move the branch to the last one
+        // that applied cleanly, then stop and hand control back to the user.
+        this.HEAD = newHead;
+        if (this.currentBranch) this.branches[this.currentBranch] = newHead;
+        this.workingDir = {};
+        this.staging = {};
+        for (var wf in nextFiles) {
+          this.workingDir[wf] = {
+            content: nextFiles[wf].content,
+            status: replayedConflicts.indexOf(wf) !== -1 ? 'modified' : 'committed'
+          };
+        }
+        this.mergeConflict = replayedConflicts;
+        this.mergeConflictKinds = null;
+        this.pendingMerge = { branch: target, targetHash: targetHash };
+        this._rebaseRemaining = toReplay.slice(i + 1);
+        return {
+          success: false,
+          output: 'error: 无法应用 ' + src.hash.substring(0, 7) + '... ' + src.message + '\n' +
+                  'CONFLICT (content): 冲突文件 ' + replayedConflicts.join(', ') + '\n' +
+                  'rebase 已暂停。请解决冲突后 git add <file>，再 git commit 继续。'
+        };
       }
 
       var newHash = generateHash();
@@ -1130,7 +1313,8 @@ var GitTutorial = window.GitTutorial || {};
         files: nextFiles,
         parent: newHead,
         timestamp: Date.now(),
-        branch: this.currentBranch
+        branch: this.currentBranch,
+        author: src.author || this._authorName()
       });
       newHead = newHash;
       applied++;
@@ -1187,7 +1371,32 @@ var GitTutorial = window.GitTutorial || {};
       return { success: false, output: 'No stash entries found.' };
     }
 
-    var entry = this.stash.pop();
+    // Refuse to clobber committed work that changed since the stash was taken.
+    var entry = this.stash[this.stash.length - 1];
+    var headCommit = this.HEAD ? this._getCommit(this.HEAD) : null;
+    var headFiles = (headCommit && headCommit.files) || {};
+    var wouldClobber = [];
+    for (var cf in entry.workingDir) {
+      var stashed = entry.workingDir[cf];
+      if (stashed.status === 'committed') continue;
+      var current = this.workingDir[cf];
+      if (!current) continue;
+      // The file changed on this branch since the stash was created.
+      if (current.status === 'committed' && headFiles[cf] &&
+          headFiles[cf].content !== (stashed.content || '')) {
+        wouldClobber.push(cf);
+      }
+    }
+    if (wouldClobber.length > 0) {
+      return {
+        success: false,
+        output: 'error: 恢复 stash 会覆盖这些文件在当前分支上的已提交内容:\n  ' +
+                wouldClobber.join('\n  ') + '\n' +
+                '请先提交或备份，再 git stash pop。'
+      };
+    }
+
+    this.stash.pop();
     // Restore
     for (var f in entry.workingDir) {
       if (entry.workingDir[f].status !== 'committed') {
@@ -1205,9 +1414,13 @@ var GitTutorial = window.GitTutorial || {};
     if (this.stash.length === 0) {
       return { success: true, output: 'No stash entries found.' };
     }
+    // git numbers stashes newest-first: the entry `pop` would take is always
+    // stash@{0}.
     var lines = [];
+    var n = 0;
     for (var i = this.stash.length - 1; i >= 0; i--) {
-      lines.push('stash@{' + i + '}: ' + this.stash[i].message);
+      lines.push('stash@{' + n + '}: ' + this.stash[i].message);
+      n++;
     }
     return { success: true, output: lines.join('\n') };
   };
@@ -1271,10 +1484,14 @@ var GitTutorial = window.GitTutorial || {};
         };
       }
       this.staging = {};
+      // Record the conflict so commit/checkout stay blocked until it is resolved.
+      this.mergeConflict = conflicts;
+      this.mergeConflictKinds = null;
+      this.pendingMerge = { branch: 'cherry-pick ' + target.hash.substring(0, 7), targetHash: target.hash };
       return {
         success: false,
         output: 'error: could not apply ' + target.hash.substring(0, 7) + '... ' + target.message +
-                '\n冲突文件: ' + conflicts.join(', ') +
+                '\nCONFLICT (content): 冲突文件 ' + conflicts.join(', ') +
                 '\n请手动解决冲突后 git add <file> 并 git commit。'
       };
     }
@@ -1453,6 +1670,13 @@ var GitTutorial = window.GitTutorial || {};
       var tagNames = Object.keys(this.tags);
       if (tagNames.length === 0) return { success: true, output: '' };
       return { success: true, output: tagNames.join('\n') };
+    }
+    // Reject names git would refuse, and never treat a flag as a tag name.
+    if (name.charAt(0) === '-') {
+      return { success: false, output: "error: 未知选项 '" + name + "'，用法: git tag <name>" };
+    }
+    if (/[\s~^:?*\[\\]/.test(name) || name.indexOf('..') !== -1) {
+      return { success: false, output: "fatal: '" + name + "' is not a valid tag name." };
     }
     if (this.tags[name]) {
       return { success: false, output: "fatal: tag '" + name + "' already exists" };
@@ -1735,16 +1959,12 @@ var GitTutorial = window.GitTutorial || {};
   };
 
   // True when two hunks touch the same region of the base file.
+  // Git merges two changes cleanly only when at least one unchanged line
+  // separates them, so hunks that merely abut (a.end === b.start) still
+  // conflict. Using strict `<` here let adjacent-line edits auto-merge and
+  // silently produced results real git would refuse.
   GitState.prototype._hunksOverlap = function(a, b) {
-    // A pure insertion (start === end) conflicts when it lands inside or on the
-    // boundary of the other hunk's replaced range.
-    if (a.start === a.end) {
-      return b.start <= a.start && a.start <= b.end;
-    }
-    if (b.start === b.end) {
-      return a.start <= b.start && b.start <= a.end;
-    }
-    return a.start < b.end && b.start < a.end;
+    return a.start <= b.end && b.start <= a.end;
   };
 
   // Three-way merge of one file's content.
@@ -1866,6 +2086,155 @@ var GitTutorial = window.GitTutorial || {};
       cursor++;
     }
     return out;
+  };
+
+  // === Git Config ===
+  // git config [--global] <key> [<value>]  /  git config [--global] --list
+  GitState.prototype.config_ = function(scope, key, value) {
+    var store = scope === 'global' ? this.config.global : this.config.local;
+    var scopeLabel = scope === 'global' ? 'global' : 'local';
+
+    if (!key) {
+      // List everything, local first then global
+      var lines = [];
+      var lk = Object.keys(this.config.local);
+      for (var i = 0; i < lk.length; i++) lines.push(lk[i] + '=' + this.config.local[lk[i]]);
+      var gk = Object.keys(this.config.global);
+      for (var j = 0; j < gk.length; j++) lines.push(gk[j] + '=' + this.config.global[gk[j]]);
+      return { success: true, output: lines.join('\n') };
+    }
+
+    if (value === undefined || value === null) {
+      // Read: local overrides global, like real git
+      if (key in this.config.local) return { success: true, output: this.config.local[key] };
+      if (key in this.config.global) return { success: true, output: this.config.global[key] };
+      return { success: false, output: '' };
+    }
+
+    store[key] = value;
+    return { success: true, output: '配置已保存 (' + scopeLabel + '): ' + key + ' = ' + value };
+  };
+
+  // === Git Remote ===
+  GitState.prototype.remoteCmd = function(sub, name, url) {
+    if (!sub || sub === '-v' || sub === '--verbose') {
+      if (!this.remote.url) return { success: true, output: '' };
+      return {
+        success: true,
+        output: 'origin\t' + this.remote.url + ' (fetch)\n' +
+                'origin\t' + this.remote.url + ' (push)'
+      };
+    }
+
+    if (sub === 'add') {
+      if (!name || !url) {
+        return { success: false, output: '用法: git remote add <name> <url>' };
+      }
+      if (this.remote.url) {
+        return { success: false, output: "error: remote " + name + " already exists." };
+      }
+      this.remote.url = url;
+      return { success: true, output: '已添加远程仓库: ' + name + ' -> ' + url };
+    }
+
+    if (sub === 'remove' || sub === 'rm') {
+      if (!this.remote.url) {
+        return { success: false, output: "error: No such remote: '" + (name || 'origin') + "'" };
+      }
+      this.remote.url = null;
+      return { success: true, output: '已移除远程仓库: ' + (name || 'origin') };
+    }
+
+    return { success: false, output: '用法: git remote [add|remove|-v] <name> [<url>]' };
+  };
+
+  // === Git Show ===
+  // Shows a commit (or a tag pointing at one) in a compact log-like form.
+  GitState.prototype.show = function(rev) {
+    if (!this.initialized) {
+      return { success: false, output: '尚未初始化仓库。请先输入: git init' };
+    }
+    if (!rev) return { success: false, output: '用法: git show <commit|tag>' };
+
+    var commit = this._resolveRevision(rev);
+    if (commit && commit.error) return { success: false, output: commit.error };
+    if (!commit) {
+      return { success: false, output: "fatal: ambiguous argument '" + rev + "': unknown revision" };
+    }
+
+    var lines = [];
+    lines.push('commit ' + commit.hash);
+    if (commit.mergeParent) {
+      lines.push('Merge: ' + commit.parent.substring(0, 7) + ' ' + commit.mergeParent.substring(0, 7));
+    }
+    lines.push('    ' + commit.message);
+    lines.push('');
+
+    // Show what the commit changed relative to its first parent
+    var parentCommit = commit.parent ? this._getCommit(commit.parent) : null;
+    var parentFiles = (parentCommit && parentCommit.files) || {};
+    var files = commit.files || {};
+    var touched = {};
+    for (var f in files) touched[f] = true;
+    for (var p in parentFiles) touched[p] = true;
+
+    var any = false;
+    for (var path in touched) {
+      var before = parentFiles[path] ? parentFiles[path].content : '';
+      var after = files[path] ? files[path].content : '';
+      if (before === after) continue;
+      any = true;
+      lines.push(this._formatDiff(path, before, after));
+    }
+    if (!any) lines.push('(该提交没有文件变更)');
+
+    return { success: true, output: lines.join('\n') };
+  };
+
+  // === Git Blame ===
+  // Attributes every line of a file to the commit that last changed it.
+  GitState.prototype.blame = function(filename) {
+    if (!this.initialized) {
+      return { success: false, output: '尚未初始化仓库。请先输入: git init' };
+    }
+    if (!filename) return { success: false, output: '用法: git blame <file>' };
+
+    var wd = this.workingDir[filename];
+    if (!wd) return { success: false, output: '文件不存在: ' + filename };
+
+    var lines = (wd.content || '').split('\n');
+
+    // Walk history newest-first; the first commit whose content for this line
+    // differs from the next-newer version owns that line.
+    var history = [];
+    var cursor = this.HEAD;
+    while (cursor) {
+      var c = this._getCommit(cursor);
+      if (!c) break;
+      if (c.files && c.files[filename]) history.push(c);
+      cursor = c.parent;
+    }
+
+    var out = [];
+    for (var i = 0; i < lines.length; i++) {
+      var owner = null;
+      for (var h = 0; h < history.length; h++) {
+        var content = history[h].files[filename].content || '';
+        var cLines = content.split('\n');
+        if (cLines[i] === lines[i]) { owner = history[h]; break; }
+      }
+      var hashLabel = owner ? owner.hash.substring(0, 7) : '0000000';
+      var who = (owner && owner.author) || this._authorName();
+      out.push(hashLabel + ' (' + who + ') ' + lines[i]);
+    }
+    return { success: true, output: out.join('\n') };
+  };
+
+  // Effective user name from git config, mirroring local-over-global precedence.
+  GitState.prototype._authorName = function() {
+    if (this.config.local['user.name']) return this.config.local['user.name'];
+    if (this.config.global['user.name']) return this.config.global['user.name'];
+    return 'unknown';
   };
 
   GitState.prototype.resetAll = function() {

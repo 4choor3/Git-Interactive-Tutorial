@@ -397,7 +397,7 @@ var GitTutorial = window.GitTutorial || {};
     }
 
     var branchHtml = '<div style="font-size:11px;color:var(--text-muted);padding:4px 8px;margin-bottom:4px">☁️ origin/' +
-      this.state.currentBranch + ' · ' + this.state.remote.commits.length + ' commits</div>';
+      (this.state.currentBranch || 'HEAD') + ' · ' + this.state.remote.commits.length + ' commits</div>';
     el.innerHTML = branchHtml + html;
   };
 

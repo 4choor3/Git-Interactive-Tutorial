@@ -297,9 +297,11 @@
     }
   });
 
+  // Render the edit preview using the same LCS diff the terminal's `git diff`
+  // uses, so the modal and the command output never disagree. An index-by-index
+  // comparison would repaint every line after an insertion as changed.
   function computeFileDiff(fileName, wdContent) {
     var st = state.staging[fileName];
-    var stContent = st ? st.content : '';
     var committedContent = '';
 
     if (state.HEAD) {
@@ -308,31 +310,34 @@
         committedContent = lastCommit.files[fileName].content || '';
       }
     }
-    var compareContent = st ? stContent : committedContent;
+    var compareContent = st ? st.content : committedContent;
 
     if (wdContent === compareContent) {
-      return ''; 
+      return '';
     }
 
-    var oldLines = compareContent.split('\n');
-    var newLines = wdContent.split('\n');
+    // Reuse the state's line diff: feed it the two versions and keep only the
+    // body lines (skip the diff --git / --- / +++ / @@ headers).
+    var raw = state._formatDiff(fileName, compareContent, wdContent);
+    var lines = raw.split('\n');
     var html = '';
+    var started = false;
 
-    var maxLen = Math.max(oldLines.length, newLines.length);
-    for (var i = 0; i < maxLen; i++) {
-      var oldLine = i < oldLines.length ? oldLines[i] : undefined;
-      var newLine = i < newLines.length ? newLines[i] : undefined;
-
-      if (oldLine === newLine) {
-        html += '<span class="diff-line">' + escapeHtml(oldLine !== undefined ? oldLine : '') + '</span>\n';
-      } else {
-        if (oldLine !== undefined) {
-          html += '<span class="diff-line diff-del">' + escapeHtml(oldLine) + '</span>\n';
-        }
-        if (newLine !== undefined) {
-          html += '<span class="diff-line diff-add">' + escapeHtml(newLine) + '</span>\n';
-        }
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (!started) {
+        if (line.charAt(0) === '@') started = true;   // first hunk header
+        continue;
       }
+      if (line.charAt(0) === '@') continue;           // later hunk headers
+
+      var cls = 'diff-line';
+      var text = line;
+      if (line.charAt(0) === '+') { cls += ' diff-add'; text = line.substring(1); }
+      else if (line.charAt(0) === '-') { cls += ' diff-del'; text = line.substring(1); }
+      else if (line.charAt(0) === ' ') { text = line.substring(1); }
+
+      html += '<span class="' + cls + '">' + escapeHtml(text) + '</span>\n';
     }
     return html;
   }
@@ -404,7 +409,9 @@
         remote: state.remote,
         stash: state.stash,
         tags: state.tags,
+        config: state.config,
         mergeConflict: state.mergeConflict,
+        mergeConflictKinds: state.mergeConflictKinds,
         pendingMerge: state.pendingMerge,
         visibleArrows: renderer.visibleArrows
       }));

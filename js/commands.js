@@ -6,7 +6,8 @@ var GitTutorial = window.GitTutorial || {};
 
   // Helper: extract the value of a flag like -m / --message.
   // Handles `-m msg`, `-m "multi word msg"`, `-m"msg"` and `--message=msg`.
-  // Everything after -m joins into the message, so multi-word messages survive.
+  // Only the words belonging to the message are consumed: a trailing option
+  // such as `git commit -m "msg" --no-verify` must not leak into the message.
   function getMessage(args, flag) {
     for (var i = 0; i < args.length; i++) {
       var a = args[i];
@@ -18,10 +19,12 @@ var GitTutorial = window.GitTutorial || {};
       }
 
       if (a === flag) {
-        if (i + 1 < args.length) {
-          return args.slice(i + 1).join(' ');
+        var words = [];
+        for (var j = i + 1; j < args.length; j++) {
+          if (args[j].charAt(0) === '-' && args[j].length > 1) break;
+          words.push(args[j]);
         }
-        return null;
+        return words.length > 0 ? words.join(' ') : null;
       }
 
       // Attached form: -m"msg" / -mmsg
@@ -49,13 +52,28 @@ var GitTutorial = window.GitTutorial || {};
     // === add ===
     'add': function(state, args) {
       if (args.length === 0) {
-        return { success: false, output: '用法: git add <file> 或 git add .' };
+        return { success: false, output: '用法: git add <file>... 或 git add .' };
       }
       // git add -A / --all / -u behave like `add .` in this simulator
       if (args[0] === '-A' || args[0] === '--all' || args[0] === '-u') {
         return state.add('.');
       }
-      return state.add(args[0]);
+      // Stage every path given, not just the first.
+      var stagedCount = 0;
+      var errors = [];
+      for (var i = 0; i < args.length; i++) {
+        if (args[i].charAt(0) === '-') continue;
+        var res = state.add(args[i]);
+        if (res.success) stagedCount++;
+        else errors.push(res.output);
+      }
+      if (stagedCount === 0) {
+        return { success: false, output: errors.join('\n') || '没有文件可以暂存' };
+      }
+      if (errors.length > 0) {
+        return { success: true, output: '暂存了 ' + stagedCount + ' 个文件\n' + errors.join('\n') };
+      }
+      return { success: true, output: '暂存了 ' + stagedCount + ' 个文件' };
     },
 
     // === status ===
@@ -93,18 +111,28 @@ var GitTutorial = window.GitTutorial || {};
     'log': function(state, args) {
       var count = null;
       var nIdx = args.indexOf('-n');
-      if (nIdx !== -1 && nIdx + 1 < args.length) {
-        count = parseInt(args[nIdx + 1], 10);
-      }
-      if (args.length > 0 && !isNaN(parseInt(args[0], 10))) {
+      if (nIdx !== -1) {
+        var raw = args[nIdx + 1];
+        if (raw === undefined || isNaN(parseInt(raw, 10))) {
+          return { success: false, output: 'fatal: -n requires an argument' };
+        }
+        count = parseInt(raw, 10);
+      } else if (args.length > 0 && !isNaN(parseInt(args[0], 10))) {
         count = parseInt(args[0], 10);
       }
+      // Unknown flags are ignored, matching git's tolerance for display flags
+      // this simulator does not model (--oneline, --stat, ...).
       return state.log(count);
     },
 
     // === branch ===
     'branch': function(state, args) {
       if (args.length === 0) {
+        return state.branch(null);
+      }
+      // Listing / inspection flags behave like a bare `git branch`.
+      if (args[0] === '-v' || args[0] === '-a' || args[0] === '--list' ||
+          args[0] === '-r' || args[0] === '-vv' || args[0] === '--all') {
         return state.branch(null);
       }
       // Handle -d (delete)
@@ -135,6 +163,27 @@ var GitTutorial = window.GitTutorial || {};
         delete state.branches[delName];
         return { success: true, output: "Deleted branch " + delName + "." };
       }
+      if (args[0] === '-m' || args[0] === '-M') {
+        // Rename a branch. With one name, rename the current branch.
+        var from = args.length >= 3 ? args[1] : state.currentBranch;
+        var to = args.length >= 3 ? args[2] : args[1];
+        if (!to) return { success: false, output: '用法: git branch -m [<old>] <new>' };
+        if (!(from in state.branches)) {
+          return { success: false, output: "error: branch '" + from + "' not found." };
+        }
+        if (to in state.branches) {
+          return { success: false, output: "fatal: A branch named '" + to + "' already exists." };
+        }
+        state.branches[to] = state.branches[from];
+        delete state.branches[from];
+        if (state.currentBranch === from) state.currentBranch = to;
+        return { success: true, output: "已重命名分支: " + from + " -> " + to };
+      }
+      // Reject anything else that starts with a dash instead of creating a
+      // branch literally named "-x".
+      if (args[0].charAt(0) === '-') {
+        return { success: false, output: "error: 未知选项 '" + args[0] + "'，用法: git branch [-d|-D|-m] [<name>]" };
+      }
       return state.branch(args[0]);
     },
 
@@ -151,18 +200,15 @@ var GitTutorial = window.GitTutorial || {};
       }
       if (args[0] === '-b') {
         if (args.length < 2) {
-          return { success: false, output: '用法: git checkout -b <branch-name>' };
+          return { success: false, output: '用法: git checkout -b <branch-name> [<start-point>]' };
         }
-        if(args.length === 2)
-        {
+        if (args.length === 2) {
           return state.checkoutNewBranch(args[1]);
         }
-        if(args.length === 3)
-        {
-          return state.checkoutCommitNewBranch(args[1], args[2]);
-        }
-      }else if(!(args[0] in state.branches))
-      {
+        // `git checkout -b <name> <start-point>` — extra trailing args are ignored.
+        return state.checkoutCommitNewBranch(args[1], args[2]);
+      }
+      if (!(args[0] in state.branches)) {
         return state.checkoutCommit(args[0]);
       }
       return state.checkout(args[0]);
@@ -256,12 +302,14 @@ var GitTutorial = window.GitTutorial || {};
     'reset': function(state, args) {
       var mode = '--mixed';
       var target = null;
+      var KNOWN = { '--soft': 1, '--mixed': 1, '--hard': 1, '--keep': 1, '--merge': 1 };
 
       for (var i = 0; i < args.length; i++) {
-        if (args[i] === '--soft' || args[i] === '--mixed' || args[i] === '--hard') {
-          mode = args[i];
-        } else if (args[i] === '--keep') {
-          mode = '--mixed';
+        if (KNOWN[args[i]]) {
+          mode = (args[i] === '--keep' || args[i] === '--merge') ? '--mixed' : args[i];
+        } else if (args[i].charAt(0) === '-' && args[i].length > 1) {
+          // An unrecognised option is an option error, not a revision.
+          return { success: false, output: "error: unknown option `" + args[i].replace(/^--?/, '') + "'" };
         } else if (!target) {
           target = args[i];
         }
@@ -283,19 +331,48 @@ var GitTutorial = window.GitTutorial || {};
 
     // === tag ===
     'tag': function(state, args) {
-      return state.tag(args[0]);
+      // `git tag` / `git tag -l` list; `-a <name> -m <msg>` creates a tag named
+      // <name> (the flags must never become the tag name itself).
+      var name = null;
+      for (var i = 0; i < args.length; i++) {
+        var a = args[i];
+        if (a === '-l' || a === '--list') return state.tag(null);
+        if (a === '-a' || a === '-s' || a === '-m' || a === '--message' || a === '-d' || a === '-f') {
+          // Skip this flag and, for -m/--message, its value.
+          if (a === '-m' || a === '--message') i++;
+          continue;
+        }
+        if (a.charAt(0) === '-') continue;
+        if (!name) name = a;
+      }
+      return state.tag(name);
     },
 
     // === rm ===
     'rm': function(state, args) {
       if (args.length === 0) {
-        return { success: false, output: '用法: git rm <file> 或 git rm --cached <file>' };
+        return { success: false, output: '用法: git rm <file>... 或 git rm --cached <file>' };
       }
       if (args[0] === '--cached') {
         if (!args[1]) return { success: false, output: '用法: git rm --cached <file>' };
         return state.rmCached(args[1]);
       }
-      return state.rm(args[0]);
+      // Remove every path given, not just the first.
+      var removed = 0;
+      var errors = [];
+      for (var i = 0; i < args.length; i++) {
+        if (args[i].charAt(0) === '-') continue;
+        var res = state.rm(args[i]);
+        if (res.success) removed++;
+        else errors.push(res.output);
+      }
+      if (removed === 0) {
+        return { success: false, output: errors.join('\n') || '没有文件被删除' };
+      }
+      if (errors.length > 0) {
+        return { success: true, output: "rm '" + removed + "' 个文件\n" + errors.join('\n') };
+      }
+      return { success: true, output: "rm " + removed + " 个文件" };
     },
 
     // === restore ===
@@ -323,12 +400,53 @@ var GitTutorial = window.GitTutorial || {};
       return state.restore(fileArg);
     },
 
+    // === config ===
+    'config': function(state, args) {
+      var scope = 'local';
+      var rest = [];
+      for (var i = 0; i < args.length; i++) {
+        if (args[i] === '--global' || args[i] === '--system') scope = 'global';
+        else if (args[i] === '--local') scope = 'local';
+        else if (args[i] === '--list' || args[i] === '-l') { /* list via no-key path */ }
+        else rest.push(args[i]);
+      }
+      var value = rest.length > 1 ? rest.slice(1).join(' ') : undefined;
+      return state.config_(scope, rest[0], value);
+    },
+
+    // === remote ===
+    'remote': function(state, args) {
+      if (args.length === 0) return state.remoteCmd(null);
+      if (args[0] === '-v' || args[0] === '--verbose') return state.remoteCmd('-v');
+      if (args[0] === 'add') return state.remoteCmd('add', args[1], args[2]);
+      if (args[0] === 'remove' || args[0] === 'rm') return state.remoteCmd('remove', args[1]);
+      if (args[0] === 'show' || args[0] === 'get-url') return state.remoteCmd('-v');
+      return { success: false, output: '用法: git remote [add|remove|-v] <name> [<url>]' };
+    },
+
+    // === show ===
+    'show': function(state, args) {
+      if (args.length === 0) return { success: false, output: '用法: git show <commit|tag>' };
+      return state.show(args[0]);
+    },
+
+    // === blame ===
+    'blame': function(state, args) {
+      // Tolerate `git blame -L 10,20 file` by taking the last non-flag argument.
+      var file = null;
+      for (var k = args.length - 1; k >= 0; k--) {
+        if (args[k].charAt(0) !== '-') { file = args[k]; break; }
+      }
+      if (!file) return { success: false, output: '用法: git blame <file>' };
+      return state.blame(file);
+    },
+
     // === touch (helper: create file) ===
     'touch': function(state, args) {
       if (args.length === 0) {
         return { success: false, output: '用法: touch <filename>' };
       }
-      return state.createFile(args[0], args.slice(1).join(' ') || 'hello world');
+      return state.createFile(args[0], args.length > 1 ? args.slice(1).join(' ') : '');
     },
 
     // === echo (helper: write content to file) ===
@@ -397,6 +515,10 @@ var GitTutorial = window.GitTutorial || {};
           '  git tag [name]        创建/列出标签',
           '  git rm <file>         删除文件 (--cached 仅取消跟踪)',
           '  git restore <file>    恢复文件 (--staged 取消暂存)',
+          '  git config [--global] <key> [<value>]  配置用户信息',
+          '  git remote [add|remove|-v] <name> [<url>]  管理远程仓库',
+          '  git show <commit|tag> 查看提交详情',
+          '  git blame <file>      逐行追溯修改者',
           '',
           '辅助命令:',
           '  touch <file>          创建文件',
