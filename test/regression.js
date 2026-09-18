@@ -788,6 +788,124 @@
       strip(r._formatInline('`>>` 追加')) === '>> 追加',
       strip(r._formatInline('`>>` 追加')));
   })();
+
+  // ============ 35. 渲染层安全与容错（renderer 审计）============
+  (function(){
+    var r = new GT.Renderer(new GT.GitState());
+    function dom(h){ var d = document.createElement('div'); d.innerHTML = h; return d; }
+
+    // 35a: branch name must be escaped in the git graph
+    var s = new GT.GitState();
+    s.initialized = true;
+    s.commits = [{ hash:'abc1234', message:'c1', files:{}, parent:null, branch:'main', timestamp:1 }];
+    s.HEAD = 'abc1234';
+    s.branches = {};
+    s.branches['<img src=x onerror=alert(1)>'] = 'abc1234';
+    s.currentBranch = '<img src=x onerror=alert(1)>';
+    var host = document.createElement('div');
+    host.style.cssText = 'position:absolute;left:-9999px';
+    document.body.appendChild(host);
+    var r2 = new GT.Renderer(s);
+    r2.zones.local = host;
+    r2._renderLocalRepo();
+    check('分支名转义，不生成真实标签', host.querySelector('img') === null, host.innerHTML.substring(0,120));
+    document.body.removeChild(host);
+
+    // 35b: a * inside a code span must not become emphasis
+    var a = r._formatInline('`git commit -m "*"` 和 *note*');
+    check('反引号内星号不被当成强调',
+      a === '<code>git commit -m "*"</code> 和 <em>note</em>', a);
+    var mismatched = /<code>[^<]*<em>/.test(a) || /<\/code>\s*<\/em>/.test(a);
+    check('反引号内星号不产生错配标签', !mismatched, a);
+
+    // 35c: closing fence tolerates trailing whitespace
+    var b = dom(r._renderMarkdown('```\ngit init\n``` \n**bold after**'));
+    check('闭合围栏容忍尾部空格',
+      b.querySelector('strong') !== null && b.textContent.indexOf('**bold') === -1,
+      b.textContent);
+
+    // 35d: a 4-backtick fence closes only on 4+
+    var c = dom(r._renderMarkdown('````\ncode\n```\nmore\n````'));
+    check('4 反引号围栏正确闭合', c.querySelectorAll('pre').length === 1 &&
+      c.textContent.indexOf('more') !== -1, c.textContent);
+
+    // 35e: staged deletion uses the red badge class
+    var s2 = new GT.GitState();
+    s2.initialized = true;
+    s2.staging = { 'gone.txt': { content:'', deleted:true } };
+    var h2 = document.createElement('div');
+    document.body.appendChild(h2);
+    var r3 = new GT.Renderer(s2);
+    r3.zones.index = h2;
+    r3._renderStaging();
+    var badge = h2.querySelector('.file-status');
+    check('暂存删除用 deleted 红色徽章', badge && badge.className.indexOf('deleted') !== -1,
+      badge ? badge.className : '(none)');
+    document.body.removeChild(h2);
+
+    // 35f: orphan history draws on a single lane
+    var s3 = new GT.GitState();
+    s3.initialized = true;
+    s3.currentBranch = null;
+    var prev = null;
+    for (var i = 1; i <= 3; i++) {
+      s3.commits.push({ hash:'h'+i, message:'c'+i, files:{}, parent:prev, branch:null, timestamp:i });
+      prev = 'h'+i;
+    }
+    s3.HEAD = 'h3';
+    s3.branches = {};
+    var h3 = document.createElement('div');
+    h3.style.cssText = 'position:absolute;left:-9999px;width:600px';
+    document.body.appendChild(h3);
+    var r4 = new GT.Renderer(s3);
+    r4.zones.local = h3;
+    r4._renderLocalRepo();
+    var cxs = [].map.call(h3.querySelectorAll('circle'), function(el){ return el.getAttribute('cx'); });
+    var uniqueCx = cxs.filter(function(v, i, arr){ return arr.indexOf(v) === i; });
+    check('直线历史只占一个泳道', uniqueCx.length === 1, JSON.stringify(cxs));
+    document.body.removeChild(h3);
+
+    // 35g: task without prompt must not print "undefined"
+    r.renderCard({ id:'x', content:'hi', task:{} });
+    check('task 无 prompt 不显示 undefined',
+      document.getElementById('task-prompt').textContent !== 'undefined',
+      document.getElementById('task-prompt').textContent);
+
+    // 35h: sidebar tolerates a chapter without cards
+    var threw = false;
+    try { r.renderSidebar([{ title:'A' }], null); } catch (e) { threw = true; }
+    check('renderSidebar 容忍缺 cards 的章节', !threw);
+  })();
+
+  // ============ 36. 教程卡片标记格式正确性 ============
+  (function(){
+    var r = new GT.Renderer(new GT.GitState());
+    function strip(h){ var d = document.createElement('div'); d.innerHTML = h; return d.textContent; }
+
+    // Every emphasis run must be balanced: rendering `**x***` style content
+    // used to leave a stray asterisk outside the bold span.
+    var bad = [];
+    GT.tutorials.forEach(function(card){
+      var lines = (card.content || '').split('\n');
+      var inCode = false;
+      lines.forEach(function(line){
+        if (/^\s*```/.test(line)) { inCode = !inCode; return; }
+        if (inCode) return;
+        var rendered = strip(r._formatInline(line));
+        // A literal ** surviving into output means the markup did not parse.
+        if (rendered.indexOf('**') !== -1) bad.push(card.id + ': ' + line);
+      });
+    });
+    check('卡片无未解析的 ** 标记', bad.length === 0, bad.join(' | '));
+
+    // Git Flow glob patterns must render completely
+    var flow = null;
+    GT.tutorials.forEach(function(c){ if (c.id === 'ch8-gitflow') flow = c; });
+    var text = strip(r._renderMarkdown(flow.content));
+    check('Git Flow 的 feature/* 完整显示', text.indexOf('feature/*') !== -1, text.substring(0, 200));
+    check('Git Flow 的 release/* 完整显示', text.indexOf('release/*') !== -1);
+    check('Git Flow 的 hotfix/* 完整显示', text.indexOf('hotfix/*') !== -1);
+  })();
   return JSON.stringify({
     pass: pass,
     fail: fail,
