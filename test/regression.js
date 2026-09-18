@@ -906,6 +906,70 @@
     check('Git Flow 的 release/* 完整显示', text.indexOf('release/*') !== -1);
     check('Git Flow 的 hotfix/* 完整显示', text.indexOf('hotfix/*') !== -1);
   })();
+
+  // ============ 37. 空文件在所有命令下的存在性语义 ============
+  (function(){
+    // A commit that only ADDS an empty file has base content === target content
+    // === '', so any check that compares content alone skips it silently.
+    // Every operation below must treat presence as part of the change.
+
+    // 37a: show reports the change
+    var t = mk();
+    run(t.p,'git init');
+    t.s.createFile('e.txt','');
+    run(t.p,'git add .'); run(t.p,'git commit -m c1');
+    var shown = out(t.p,'git show HEAD');
+    check('show 显示新增空文件的变更',
+      shown.indexOf('diff --git') !== -1 && shown.indexOf('没有文件变更') === -1,
+      shown.replace(/\n/g,' | '));
+
+    // 37b: cherry-pick carries an added empty file
+    var u = mk();
+    run(u.p,'git init'); run(u.p,'touch base.txt'); run(u.p,'git add .'); run(u.p,'git commit -m base');
+    run(u.p,'git checkout -b feat');
+    u.s.createFile('newempty.txt',''); run(u.p,'git add .'); run(u.p,'git commit -m addempty');
+    var fh = u.s.HEAD;
+    run(u.p,'git checkout main');
+    run(u.p,'git cherry-pick ' + fh);
+    check('cherry-pick 带回新增的空文件', 'newempty.txt' in u.s.workingDir,
+      JSON.stringify(Object.keys(u.s.workingDir)));
+
+    // 37c: cherry-pick carries a deleted empty file
+    var v = mk();
+    run(v.p,'git init');
+    v.s.createFile('del.txt',''); run(v.p,'git add .'); run(v.p,'git commit -m c1');
+    run(v.p,'git checkout -b feat');
+    run(v.p,'git rm del.txt'); run(v.p,'git commit -m del');
+    var dh = v.s.HEAD;
+    run(v.p,'git checkout main');
+    run(v.p,'git cherry-pick ' + dh);
+    check('cherry-pick 删除空文件', !('del.txt' in v.s.workingDir),
+      JSON.stringify(Object.keys(v.s.workingDir)));
+
+    // 37d: rebase carries an added empty file
+    var w = mk();
+    run(w.p,'git init'); run(w.p,'touch base.txt'); run(w.p,'git add .'); run(w.p,'git commit -m base');
+    run(w.p,'git checkout -b topic');
+    w.s.createFile('topicempty.txt',''); run(w.p,'git add .'); run(w.p,'git commit -m addempty');
+    run(w.p,'git checkout main'); run(w.p,'touch mainonly.txt'); run(w.p,'git add .'); run(w.p,'git commit -m mc');
+    run(w.p,'git rebase topic');
+    check('rebase 带回新增的空文件', 'topicempty.txt' in w.s.workingDir,
+      JSON.stringify(Object.keys(w.s.workingDir)));
+
+    // 37e: merge carries an added empty file
+    var x = mk();
+    run(x.p,'git init'); run(x.p,'touch base.txt'); run(x.p,'git add .'); run(x.p,'git commit -m base');
+    run(x.p,'git checkout -b feat');
+    x.s.createFile('featempty.txt',''); run(x.p,'git add .'); run(x.p,'git commit -m fe');
+    run(x.p,'git checkout main'); run(x.p,'touch m.txt'); run(x.p,'git add .'); run(x.p,'git commit -m mc');
+    run(x.p,'git merge feat');
+    check('merge 带回新增的空文件', 'featempty.txt' in x.s.workingDir,
+      JSON.stringify(Object.keys(x.s.workingDir)));
+
+    // 37f: rebase keeps the target branch's own files
+    check('rebase 同时保留目标分支的文件', 'mainonly.txt' in w.s.workingDir,
+      JSON.stringify(Object.keys(w.s.workingDir)));
+  })();
   return JSON.stringify({
     pass: pass,
     fail: fail,

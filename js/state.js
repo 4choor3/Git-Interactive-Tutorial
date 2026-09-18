@@ -1457,18 +1457,33 @@ var GitTutorial = window.GitTutorial || {};
 
     var conflicts = [];
     for (var path in touched) {
-      var baseContent = baseFiles[path] ? baseFiles[path].content : '';
-      var targetContent = targetFiles[path] ? targetFiles[path].content : '';
+      var baseEntry = baseFiles[path];
+      var targetEntry = targetFiles[path];
+      var baseContent = baseEntry ? baseEntry.content : '';
+      var targetContent = targetEntry ? targetEntry.content : '';
       var ourContent = newFiles[path] ? newFiles[path].content : '';
 
-      // The target commit did not change this path — leave ours alone.
-      if (baseContent === targetContent) continue;
+      // Compare presence too: a commit that only adds an EMPTY file has
+      // baseContent === targetContent === '' but is still a change to apply.
+      var baseExists = !!baseEntry;
+      var targetExists = !!targetEntry;
+      if (baseExists === targetExists && (!baseExists || baseContent === targetContent)) continue;
+
+      // Pure add / delete carried over from the picked commit.
+      if (!baseExists && targetExists) {
+        newFiles[path] = { content: targetContent };
+        continue;
+      }
+      if (baseExists && !targetExists) {
+        delete newFiles[path];
+        continue;
+      }
 
       var res = this._mergeFileContent(baseContent, ourContent, targetContent, 'cherry-pick ' + target.hash.substring(0, 7));
       if (res.conflict) {
         conflicts.push(path);
         newFiles[path] = { content: res.content };
-      } else if (res.content === '') {
+      } else if (res.content === '' && ourContent === '' && targetContent === '') {
         delete newFiles[path];
       } else {
         newFiles[path] = { content: res.content };
@@ -2180,10 +2195,18 @@ var GitTutorial = window.GitTutorial || {};
 
     var any = false;
     for (var path in touched) {
-      var before = parentFiles[path] ? parentFiles[path].content : '';
-      var after = files[path] ? files[path].content : '';
-      if (before === after) continue;
+      var beforeEntry = parentFiles[path];
+      var afterEntry = files[path];
+      // Presence matters as much as content: adding or removing an EMPTY file
+      // is a real change even though both sides read as ''.
+      var beforeExists = !!beforeEntry;
+      var afterExists = !!afterEntry;
+      if (beforeExists === afterExists &&
+          (!beforeExists || beforeEntry.content === afterEntry.content)) continue;
+
       any = true;
+      var before = beforeExists ? beforeEntry.content : '';
+      var after = afterExists ? afterEntry.content : '';
       lines.push(this._formatDiff(path, before, after));
     }
     if (!any) lines.push('(该提交没有文件变更)');
