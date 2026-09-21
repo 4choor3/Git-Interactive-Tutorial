@@ -1728,34 +1728,42 @@ var GitTutorial = window.GitTutorial || {};
   };
 
   // === Git Restore ===
+  // git restore <file>: restore the WORKING TREE from the index (staging area).
+  // For files that were never staged the index equals HEAD, so unstaged edits
+  // are discarded and the file returns to its last-committed content. The
+  // staging area itself is left untouched (real `git restore` writes worktree only).
   GitState.prototype.restore = function(filename) {
     if (!this.initialized) {
       return { success: false, output: '尚未初始化仓库。请先输入: git init' };
     }
-
-    // Restore from the HEAD commit. A file that no longer exists in the working
-    // dir but is tracked at HEAD is resurrected (this covers `git rm` undo).
     var commit = this.HEAD ? this._getCommit(this.HEAD) : null;
-    var inHead = !!(commit && commit.files && commit.files[filename]);
+    var headContent = (commit && commit.files && commit.files[filename])
+      ? commit.files[filename].content : null;
+    // index content = staged version if present, otherwise HEAD
+    var indexContent = this.staging[filename] ? this.staging[filename].content : headContent;
 
-    // Unstage first: restoring also clears a pending staged change for the file.
-    delete this.staging[filename];
-
-    if (!inHead) {
-      // Not tracked at HEAD — drop it from the working dir and staging entirely.
-      delete this.workingDir[filename];
-      return { success: true, output: '已恢复: ' + filename + '（该文件未被跟踪，已移除）' };
+    if (indexContent === null) {
+      return { success: false, output: 'error: 未跟踪的文件: ' + filename + '\n（git restore 不能恢复未跟踪文件，请先 git add 或 rm）' };
     }
 
-    this.workingDir[filename] = {
-      content: commit.files[filename].content,
-      status: 'committed'
-    };
-    return { success: true, output: '已恢复: ' + filename };
+    if (!this.workingDir[filename]) {
+      // deleted from worktree — resurrect it from the index
+      this.workingDir[filename] = {
+        content: indexContent,
+        status: this.staging[filename] ? 'modified' : 'committed'
+      };
+    } else {
+      this.workingDir[filename].content = indexContent;
+      this.workingDir[filename].status = this.staging[filename] ? 'modified' : 'committed';
+    }
+    // staging area unchanged
+    return { success: true, output: '已恢复工作区 (来自暂存区/HEAD): ' + filename };
   };
 
-  // git restore --source=<rev> <file>: restore the file content from a revision.
-  GitState.prototype.restoreFrom = function(rev, filename) {
+  // git restore --source=<rev> <file>: restore the file from a revision.
+  // Without --staged it writes only the WORKING TREE; with --staged it writes
+  // only the index. The other area is left untouched.
+  GitState.prototype.restoreFrom = function(rev, filename, staged) {
     if (!this.initialized) {
       return { success: false, output: '尚未初始化仓库。请先输入: git init' };
     }
@@ -1764,23 +1772,27 @@ var GitTutorial = window.GitTutorial || {};
     if (!commit) {
       return { success: false, output: "fatal: ambiguous argument '" + rev + "': unknown revision" };
     }
-
-    delete this.staging[filename];
-
-    if (!commit.files || !commit.files[filename]) {
-      // Not present in that revision — remove it from the working dir.
-      delete this.workingDir[filename];
-      return { success: true, output: '已从 ' + rev + ' 恢复: ' + filename + '（该版本中不存在，已移除）' };
+    var revContent = (commit.files && commit.files[filename])
+      ? commit.files[filename].content : null;
+    if (revContent === null) {
+      return { success: false, output: "error: 路径 '" + filename + "' 在 " + rev + " 中不存在，无法恢复" };
     }
 
-    this.workingDir[filename] = {
-      content: commit.files[filename].content,
-      status: 'modified'
-    };
-    return { success: true, output: '已从 ' + rev + ' 恢复: ' + filename };
+    if (staged) {
+      this.staging[filename] = { content: revContent, status: 'modified' };
+      return { success: true, output: '已从 ' + rev + ' 恢复暂存区: ' + filename };
+    }
+
+    if (!this.workingDir[filename]) {
+      this.workingDir[filename] = { content: revContent, status: 'modified' };
+    } else {
+      this.workingDir[filename].content = revContent;
+      this.workingDir[filename].status = this.staging[filename] ? 'modified' : 'committed';
+    }
+    return { success: true, output: '已从 ' + rev + ' 恢复工作区: ' + filename };
   };
 
-  // git restore --staged <file>: unstage, keeping working dir content.
+  // git restore --staged <file>: unstage, keeping working dir content (real `git restore --staged`).
   GitState.prototype.restoreStaged = function(filename) {    if (!this.initialized) {
       return { success: false, output: '尚未初始化仓库。请先输入: git init' };
     }
@@ -1798,6 +1810,22 @@ var GitTutorial = window.GitTutorial || {};
       }
     }
     return { success: true, output: '已取消暂存: ' + filename };
+  };
+
+  // git restore --staged --worktree <file>: reset BOTH index and worktree to HEAD.
+  GitState.prototype.restoreAll = function(filename) {
+    if (!this.initialized) {
+      return { success: false, output: '尚未初始化仓库。请先输入: git init' };
+    }
+    var commit = this.HEAD ? this._getCommit(this.HEAD) : null;
+    var headContent = (commit && commit.files && commit.files[filename])
+      ? commit.files[filename].content : null;
+    if (headContent === null) {
+      return { success: false, output: 'error: 未跟踪的文件: ' + filename };
+    }
+    delete this.staging[filename];
+    this.workingDir[filename] = { content: headContent, status: 'committed' };
+    return { success: true, output: '已恢复到最后一次提交 (工作区+暂存区): ' + filename };
   };
 
   // === Helpers ===

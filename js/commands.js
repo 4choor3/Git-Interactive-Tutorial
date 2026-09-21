@@ -378,25 +378,25 @@ var GitTutorial = window.GitTutorial || {};
     // === restore ===
     'restore': function(state, args) {
       if (args.length === 0) {
-        return { success: false, output: '用法: git restore <file> 或 git restore --staged <file>' };
+        return { success: false, output: '用法: git restore <file> | git restore --staged <file> | git restore --staged --worktree <file> | git restore --source=<rev> <file>' };
       }
-      if (args[0] === '--staged' || args[0] === '--cached') {
-        if (!args[1]) return { success: false, output: '用法: git restore --staged <file>' };
-        return state.restoreStaged(args[1]);
-      }
-      // git restore --source=<rev> <file> restores the file from that revision.
-      var source = null;
+      var staged = false, worktree = false, source = null, fileArg = null;
       for (var i = 0; i < args.length; i++) {
-        if (args[i].indexOf('--source=') === 0) {
-          source = args[i].substring('--source='.length);
-        } else if (args[i] === '--source' || args[i] === '-s') {
-          source = args[i + 1];
-        }
+        var a = args[i];
+        if (a === '--staged' || a === '--cached') staged = true;
+        else if (a === '--worktree') worktree = true;
+        else if (a.indexOf('--source=') === 0) source = a.substring('--source='.length);
+        else if (a === '--source' || a === '-s') { source = args[i + 1]; i++; }
+        else fileArg = a;
       }
-      var fileArg = args[args.length - 1];
+      if (!fileArg) {
+        return { success: false, output: '用法: git restore <file>' };
+      }
       if (source) {
-        return state.restoreFrom(source, fileArg);
+        return state.restoreFrom(source, fileArg, staged);
       }
+      if (staged && worktree) return state.restoreAll(fileArg);
+      if (staged) return state.restoreStaged(fileArg);
       return state.restore(fileArg);
     },
 

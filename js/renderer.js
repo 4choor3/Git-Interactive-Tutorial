@@ -574,15 +574,21 @@ var GitTutorial = window.GitTutorial || {};
   Renderer.prototype.renderTerminalInput = function(input) {
     var div = document.createElement('div');
     div.className = 'terminal-line input';
-
-    if (!input.startsWith('git')) {
-      div.innerHTML = '<span class="prompt-sign">$ </span>' + this._escapeHtml(input);
+    var HELPER = ['touch', 'echo', 'cat', 'clear', 'help', 'reset-tutorial'];
+    var esc = function(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); };
+    var parts = input.split(/\s+/);
+    var html = '<span class="prompt-sign">$ </span>';
+    if (parts[0] === 'git') {
+      html += '<span class="git-cmd">git</span>';
+      if (parts[1]) html += ' <span class="git-subcmd">' + esc(parts[1]) + '</span>';
+      if (parts.length > 2) html += ' <span class="cmd-arg">' + esc(parts.slice(2).join(' ')) + '</span>';
+    } else if (HELPER.indexOf(parts[0]) !== -1) {
+      html += '<span class="helper-cmd">' + esc(parts[0]) + '</span>';
+      if (parts.length > 1) html += ' <span class="cmd-arg">' + esc(parts.slice(1).join(' ')) + '</span>';
     } else {
-      div.innerHTML = '<span class="prompt-sign">$ </span><span class="git-cmd">' +
-        this._escapeHtml(input.split(' ').slice(0, 2).join(' ')) + '</span> ' +
-        this._escapeHtml(input.split(' ').slice(2).join(' '));
+      html += esc(input);
     }
-
+    div.innerHTML = html;
     this.terminalOutput.appendChild(div);
   };
 
